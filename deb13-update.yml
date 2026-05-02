@@ -1,0 +1,236 @@
+---
+# debian13-patch.yml
+# Configures apt repositories on Debian 13 (Trixie), runs a full upgrade with
+# logging, restarts services impacted by updated libraries, and reboots only
+# if the kernel was replaced.
+#
+# Usage:
+#   ansible-playbook -i inventory debian13-patch.yml
+#   ansible-playbook -i inventory debian13-patch.yml --check --diff   # dry run
+#
+# Tags:
+#   repos    — only (re)write sources
+#   upgrade  — only run apt upgrade
+#   restart  — only run needrestart
+#   reboot   — only evaluate the reboot step
+
+- name: Patch and reboot Debian 13 (Trixie) hosts
+  hosts: debian13
+  become: true
+  gather_facts: true
+
+  vars:
+    debian_codename: trixie
+    debian_components:
+      - main
+      - contrib
+      - non-free
+      - non-free-firmware
+    debian_mirror: "http://deb.debian.org/debian"
+    debian_security_mirror: "http://security.debian.org/debian-security"
+    apt_log_dir: /var/log/ansible-patching
+    apt_log_file: "{{ apt_log_dir }}/apt-upgrade-{{ ansible_date_time.iso8601_basic_short }}.log"
+    # If true, restart services affected by updated libs without prompting.
+    auto_restart_services: true
+    # If true, reboot when the running kernel no longer matches the installed one.
+    auto_reboot_on_kernel: true
+    reboot_timeout: 600
+
+  pre_tasks:
+    - name: Fail fast if this is not Debian 13
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Debian'
+          - ansible_facts['distribution_major_version'] | int == 13
+        fail_msg: >-
+          This playbook targets Debian 13 (Trixie). Host reports
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+      tags: [always]
+
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: "{{ apt_log_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      tags: [always]
+
+  tasks:
+    # ---------------------------------------------------------------- repos --
+    - name: Configure Debian 13 apt sources (deb822 format)
+      ansible.builtin.deb822_repository:
+        name: debian
+        types: [deb, deb-src]
+        uris: "{{ debian_mirror }}"
+        suites:
+          - "{{ debian_codename }}"
+          - "{{ debian_codename }}-updates"
+          - "{{ debian_codename }}-backports"
+        components: "{{ debian_components }}"
+        signed_by: /usr/share/keyrings/debian-archive-keyring.gpg
+        state: present
+        enabled: true
+      tags: [repos]
+
+    - name: Configure Debian 13 security apt sources (deb822 format)
+      ansible.builtin.deb822_repository:
+        name: debian-security
+        types: [deb, deb-src]
+        uris: "{{ debian_security_mirror }}"
+        suites:
+          - "{{ debian_codename }}-security"
+        components: "{{ debian_components }}"
+        signed_by: /usr/share/keyrings/debian-archive-keyring.gpg
+        state: present
+        enabled: true
+      tags: [repos]
+
+    - name: Remove legacy /etc/apt/sources.list if deb822 sources are present
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list
+        content: "# Managed by Ansible — see /etc/apt/sources.list.d/*.sources\n"
+        owner: root
+        group: root
+        mode: "0644"
+      tags: [repos]
+
+    - name: Refresh apt cache after repo changes
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      tags: [repos, upgrade]
+
+    # -------------------------------------------------------------- upgrade --
+    - name: Ensure tooling for upgrade and post-upgrade checks is installed
+      ansible.builtin.apt:
+        name:
+          - needrestart
+          - apt-utils
+          - debian-goodies   # provides checkrestart as a fallback
+        state: present
+      tags: [upgrade]
+
+    - name: Record kernel package version before upgrade
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${Version}\n' \
+          $(dpkg-query -W -f='${Package}\n' 'linux-image-*' \
+            | grep -E '^linux-image-[0-9]' | head -n1) || true
+      args:
+        executable: /bin/bash
+      register: kernel_pkg_before
+      changed_when: false
+      tags: [upgrade, reboot]
+
+    - name: Run full apt upgrade (dist-upgrade) and capture log
+      ansible.builtin.shell: |
+        set -o pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        {
+          echo "=== apt update/upgrade run on $(date -Is) ==="
+          echo "--- apt-get update ---"
+          apt-get update
+          echo "--- apt-get -y dist-upgrade ---"
+          apt-get -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            dist-upgrade
+          echo "--- apt-get -y autoremove --purge ---"
+          apt-get -y autoremove --purge
+          echo "--- apt-get -y autoclean ---"
+          apt-get -y autoclean
+          echo "=== run finished $(date -Is) ==="
+        } 2>&1 | tee -a "{{ apt_log_file }}"
+      args:
+        executable: /bin/bash
+      register: apt_upgrade
+      changed_when: "'0 upgraded, 0 newly installed, 0 to remove' not in apt_upgrade.stdout"
+      tags: [upgrade]
+
+    - name: Symlink latest upgrade log for convenience
+      ansible.builtin.file:
+        src: "{{ apt_log_file | basename }}"
+        dest: "{{ apt_log_dir }}/latest.log"
+        state: link
+        force: true
+      tags: [upgrade]
+
+    # ---------------------------------------------------- restart services --
+    - name: Determine which services need restarting (needrestart)
+      ansible.builtin.command: needrestart -b -r l
+      register: needrestart_report
+      changed_when: false
+      failed_when: false
+      tags: [restart]
+
+    - name: Show services flagged for restart
+      ansible.builtin.debug:
+        var: needrestart_report.stdout_lines
+      tags: [restart]
+
+    - name: Restart affected services automatically
+      ansible.builtin.command: needrestart -q -r a
+      register: needrestart_run
+      when: auto_restart_services | bool
+      changed_when: "'NEEDRESTART-SVC:' in needrestart_report.stdout"
+      tags: [restart]
+
+    # --------------------------------------------------- reboot if kernel ----
+    - name: Record kernel package version after upgrade
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${Version}\n' \
+          $(dpkg-query -W -f='${Package}\n' 'linux-image-*' \
+            | grep -E '^linux-image-[0-9]' | head -n1) || true
+      args:
+        executable: /bin/bash
+      register: kernel_pkg_after
+      changed_when: false
+      tags: [reboot]
+
+    - name: Check for /var/run/reboot-required flag
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      tags: [reboot]
+
+    - name: Compute whether a reboot is needed
+      ansible.builtin.set_fact:
+        kernel_changed: "{{ kernel_pkg_before.stdout | trim != kernel_pkg_after.stdout | trim }}"
+        running_kernel_stale: >-
+          {{ ansible_facts['kernel'] not in
+             (kernel_pkg_after.stdout | default('') | trim) }}
+        reboot_flag_present: "{{ reboot_required_file.stat.exists | default(false) }}"
+      tags: [reboot]
+
+    - name: Report reboot decision inputs
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel: {{ ansible_facts['kernel'] }}"
+          - "Installed kernel pkg before: {{ kernel_pkg_before.stdout | trim }}"
+          - "Installed kernel pkg after:  {{ kernel_pkg_after.stdout | trim }}"
+          - "Kernel package changed: {{ kernel_changed }}"
+          - "/var/run/reboot-required present: {{ reboot_flag_present }}"
+      tags: [reboot]
+
+    - name: Reboot host because kernel was updated
+      ansible.builtin.reboot:
+        msg: "Reboot triggered by Ansible — kernel package updated"
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 15
+        test_command: uptime
+      when:
+        - auto_reboot_on_kernel | bool
+        - kernel_changed or reboot_flag_present
+      tags: [reboot]
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg: >-
+          Patching complete on {{ inventory_hostname }}.
+          Log: {{ apt_log_file }}.
+          Kernel updated: {{ kernel_changed }}.
+          Reboot triggered: {{ (auto_reboot_on_kernel | bool) and (kernel_changed or reboot_flag_present) }}.
+      tags: [always]
