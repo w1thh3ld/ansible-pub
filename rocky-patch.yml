@@ -1,0 +1,240 @@
+---
+# rocky-patch.yml
+# Patches Rocky Linux 8 and 9 hosts: ensures the standard repo set, runs a
+# full dnf upgrade with logging, restarts services impacted by updated
+# libraries, and reboots only if the kernel was replaced.
+#
+# Mirrors the structure of debian13-patch.yml.
+#
+# Usage:
+#   ansible-playbook -i inventory rocky-patch.yml
+#   ansible-playbook -i inventory rocky-patch.yml --check --diff   # dry run
+#
+# Tags:
+#   repos    — only (re)apply repo configuration
+#   upgrade  — only run dnf upgrade
+#   restart  — only restart impacted services
+#   reboot   — only evaluate the reboot step
+
+- name: Patch and reboot Rocky Linux 8/9 hosts
+  hosts: rocky
+  become: true
+  gather_facts: true
+
+  vars:
+    log_dir: /var/log/ansible-patching
+    log_file: "{{ log_dir }}/dnf-upgrade-{{ ansible_date_time.iso8601_basic_short }}.log"
+    # If true, restart services flagged by `dnf needs-restarting -s`.
+    auto_restart_services: true
+    # If true, reboot when the kernel package changed or needs-restarting -r says so.
+    auto_reboot_on_kernel: true
+    # Enable PowerTools (Rocky 8) / CRB (Rocky 9). Many EPEL packages need it.
+    enable_crb: true
+    # Install epel-release so EPEL packages are available.
+    enable_epel: true
+    reboot_timeout: 600
+
+  pre_tasks:
+    - name: Fail fast if this is not Rocky 8 or 9
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Rocky'
+          - ansible_facts['distribution_major_version'] | int in [8, 9]
+        fail_msg: >-
+          This playbook targets Rocky Linux 8 or 9. Host reports
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+      tags: [always]
+
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      tags: [always]
+
+    - name: Compute version-specific repo names
+      ansible.builtin.set_fact:
+        crb_repo_name: "{{ 'powertools' if ansible_facts['distribution_major_version'] | int == 8 else 'crb' }}"
+      tags: [always]
+
+  tasks:
+    # ---------------------------------------------------------------- repos --
+    - name: Ensure base Rocky repo packages are present
+      ansible.builtin.dnf:
+        name:
+          - rocky-repos
+          - rocky-release
+          - rocky-gpg-keys
+        state: present
+      tags: [repos]
+
+    - name: Install dnf-plugins-core (provides config-manager)
+      ansible.builtin.dnf:
+        name: dnf-plugins-core
+        state: present
+      tags: [repos]
+
+    - name: Install epel-release
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+      when: enable_epel | bool
+      tags: [repos]
+
+    - name: Enable CRB / PowerTools repository
+      ansible.builtin.command: "dnf config-manager --set-enabled {{ crb_repo_name }}"
+      register: crb_enable
+      changed_when: "'is not enabled' not in crb_enable.stdout and crb_enable.rc == 0"
+      failed_when:
+        - crb_enable.rc != 0
+        - "'No matching repo' not in crb_enable.stderr"
+      when: enable_crb | bool
+      tags: [repos]
+
+    - name: Ensure baseos / appstream / extras repos are enabled
+      ansible.builtin.command: "dnf config-manager --set-enabled {{ item }}"
+      register: enable_core_repos
+      changed_when: false
+      failed_when:
+        - enable_core_repos.rc != 0
+        - "'No matching repo' not in enable_core_repos.stderr"
+      loop:
+        - baseos
+        - appstream
+        - extras
+      tags: [repos]
+
+    - name: Refresh dnf metadata cache
+      ansible.builtin.command: dnf -q makecache
+      changed_when: false
+      tags: [repos, upgrade]
+
+    # -------------------------------------------------------------- upgrade --
+    - name: Ensure tooling for upgrade and post-upgrade checks is installed
+      ansible.builtin.dnf:
+        name:
+          - yum-utils       # provides needs-restarting
+          - dnf-utils
+        state: present
+      tags: [upgrade]
+
+    - name: Record kernel package version before upgrade
+      ansible.builtin.shell: |
+        set -o pipefail
+        rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | sort -V | tail -n1
+      args:
+        executable: /bin/bash
+      register: kernel_pkg_before
+      changed_when: false
+      tags: [upgrade, reboot]
+
+    - name: Run full dnf upgrade and capture log
+      ansible.builtin.shell: |
+        set -o pipefail
+        {
+          echo "=== dnf upgrade run on $(date -Is) ==="
+          echo "--- dnf -y upgrade ---"
+          dnf -y upgrade
+          echo "--- dnf -y autoremove ---"
+          dnf -y autoremove
+          echo "--- dnf clean packages ---"
+          dnf clean packages
+          echo "=== run finished $(date -Is) ==="
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: dnf_upgrade
+      changed_when: "'Nothing to do.' not in dnf_upgrade.stdout"
+      tags: [upgrade]
+
+    - name: Symlink latest upgrade log for convenience
+      ansible.builtin.file:
+        src: "{{ log_file | basename }}"
+        dest: "{{ log_dir }}/latest.log"
+        state: link
+        force: true
+      tags: [upgrade]
+
+    # ---------------------------------------------------- restart services --
+    - name: Determine which services need restarting (needs-restarting -s)
+      ansible.builtin.command: needs-restarting -s
+      register: needs_restart_svcs
+      changed_when: false
+      failed_when: false
+      tags: [restart]
+
+    - name: Show services flagged for restart
+      ansible.builtin.debug:
+        var: needs_restart_svcs.stdout_lines
+      tags: [restart]
+
+    - name: Restart affected services automatically
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ needs_restart_svcs.stdout_lines | default([]) | reject('match', '^\\s*$') | list }}"
+      when:
+        - auto_restart_services | bool
+        - needs_restart_svcs.stdout_lines | default([]) | length > 0
+      tags: [restart]
+
+    # --------------------------------------------------- reboot if kernel ----
+    - name: Record kernel package version after upgrade
+      ansible.builtin.shell: |
+        set -o pipefail
+        rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | sort -V | tail -n1
+      args:
+        executable: /bin/bash
+      register: kernel_pkg_after
+      changed_when: false
+      tags: [reboot]
+
+    - name: Ask dnf whether a reboot is required
+      ansible.builtin.command: needs-restarting -r
+      register: needs_restart_reboot
+      changed_when: false
+      failed_when: false   # rc 1 = reboot needed, rc 0 = not needed
+      tags: [reboot]
+
+    - name: Compute whether a reboot is needed
+      ansible.builtin.set_fact:
+        kernel_changed: "{{ kernel_pkg_before.stdout | trim != kernel_pkg_after.stdout | trim }}"
+        needs_reboot: "{{ needs_restart_reboot.rc == 1 }}"
+        running_kernel_stale: >-
+          {{ ansible_facts['kernel'] not in
+             (kernel_pkg_after.stdout | default('') | trim) }}
+      tags: [reboot]
+
+    - name: Report reboot decision inputs
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel: {{ ansible_facts['kernel'] }}"
+          - "Installed kernel pkg before: {{ kernel_pkg_before.stdout | trim }}"
+          - "Installed kernel pkg after:  {{ kernel_pkg_after.stdout | trim }}"
+          - "Kernel package changed: {{ kernel_changed }}"
+          - "needs-restarting -r reports reboot needed: {{ needs_reboot }}"
+      tags: [reboot]
+
+    - name: Reboot host because kernel was updated
+      ansible.builtin.reboot:
+        msg: "Reboot triggered by Ansible — kernel package updated"
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 15
+        test_command: uptime
+      when:
+        - auto_reboot_on_kernel | bool
+        - kernel_changed or needs_reboot
+      tags: [reboot]
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg: >-
+          Patching complete on {{ inventory_hostname }}
+          (Rocky {{ ansible_facts['distribution_major_version'] }}).
+          Log: {{ log_file }}.
+          Kernel updated: {{ kernel_changed }}.
+          Reboot triggered: {{ (auto_reboot_on_kernel | bool) and (kernel_changed or needs_reboot) }}.
+      tags: [always]
