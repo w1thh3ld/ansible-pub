@@ -1,0 +1,374 @@
+---
+# intelerad-patch.yml
+# OS patching for IntelePACS servers, following Stoic IT's Intelerad
+# patching guide.
+#
+# What this playbook does (in order):
+#   1.  Pre-flight: confirm snapshot, assert supported OS, prep log dir.
+#   2.  Boot-partition check; remove old kernels (keep 3) if /boot > 70%.
+#   3.  Build the per-OS REPOS filter and the SKIP filter that excludes
+#       corosync* and pacemaker* — these MUST NEVER be updated.
+#   4.  Confirm the package list that *will* be updated and the excluded
+#       list, both written to the run log.
+#   5.  Capture pre-update PACS status (reportPacsStatus).
+#   6.  Stop PACS services gracefully in the documented order.
+#   7.  Run `yum ${REPOS} ${SKIP} update` with the log captured.
+#   8.  Reboot.
+#   9.  Re-run reportPacsStatus until OK (up to 10 minutes), then
+#       checkRestarts. If PACS still down, run the documented force-start.
+#
+# Tags:
+#   prep      — pre-flight, snapshot prompt, boot cleanup
+#   repos     — build REPOS / SKIP, write check-update report
+#   stop      — stop PACS stack
+#   upgrade   — run yum update
+#   reboot    — reboot the host
+#   verify    — post-reboot PACS status / checkRestarts
+#   recover   — force-start PACS stack (only on failure)
+#
+# Per-host overrides (set in host_vars/<hostname>.yml):
+#   use_repos_filter: false   # e.g. NSRNM - DEPOT04A — skip the REPOS var
+#   snapshot_taken: true      # skip the snapshot pause prompt
+#
+# Usage:
+#   ansible-playbook -i inventory.ini intelerad-patch.yml
+#   ansible-playbook -i inventory.ini intelerad-patch.yml --check --diff
+#   ansible-playbook -i inventory.ini intelerad-patch.yml --tags verify
+
+- name: Patch an IntelePACS server
+  hosts: intelerad
+  become: true
+  gather_facts: true
+  serial: 1                        # patch one PACS server at a time
+  any_errors_fatal: true
+
+  vars:
+    # ----------------------------------------------------------------------
+    # Packages that must NEVER be touched by yum during a PACS patch run.
+    # Add to this list, never remove from it without Intelerad's say-so.
+    # ----------------------------------------------------------------------
+    intelerad_excluded_packages:
+      - "corosync*"
+      - "pacemaker*"
+
+    # ----------------------------------------------------------------------
+    # Per-OS repo filters from the Intelerad guide.
+    # ----------------------------------------------------------------------
+    intelerad_repos_map:
+      CentOS-7: >-
+        --disablerepo=* --enablerepo=centos7-x86_64 --enablerepo=epel
+        --enablerepo=base --enablerepo=updates
+      RedHat-7: >-
+        --disablerepo=* --enablerepo=rhel-7-server-optional-rpms
+        --enablerepo=rhel-7-server-rpms --enablerepo=epel
+        --enablerepo=base --enablerepo=updates
+      RedHat-8: >-
+        --disablerepo=* --enablerepo=rhel-8-for-x86_64-baseos-rpms
+        --enablerepo=rhel-8-for-x86_64-appstream-rpms --enablerepo=epel
+        --enablerepo=base --enablerepo=updates
+
+    # Default to applying the REPOS filter; override to false on hosts where
+    # the guide says to skip it (e.g. NSRNM - DEPOT04A).
+    use_repos_filter: true
+
+    # Set to true on a host (or on the command line with -e) once a snapshot
+    # has been taken; otherwise the play pauses and prompts.
+    snapshot_taken: false
+
+    # Operational toggles
+    auto_reboot: true                    # the guide always reboots
+    boot_partition_threshold_percent: 70 # cleanup older kernels above this
+    keep_kernel_count: 3
+    pacs_status_retries: 20              # 20 × 30s ≈ 10 minutes
+    pacs_status_delay_seconds: 30
+    reboot_timeout: 900
+
+    log_dir: /var/log/ansible-patching
+    log_file: "{{ log_dir }}/intelerad-patch-{{ ansible_date_time.iso8601_basic_short }}.log"
+
+  pre_tasks:
+    # ---------------------------------------------------------------- prep --
+    - name: Assert this is a supported Intelerad OS
+      ansible.builtin.assert:
+        that:
+          - "(ansible_facts['distribution'] ~ '-' ~ ansible_facts['distribution_major_version']) in intelerad_repos_map.keys() | list"
+        fail_msg: >-
+          Unsupported OS for Intelerad patching:
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+          Supported: CentOS 7, RHEL 7, RHEL 8.
+      tags: [always, prep]
+
+    - name: Pause for snapshot confirmation (skipped if snapshot_taken=true)
+      ansible.builtin.pause:
+        prompt: >-
+          The Intelerad guide requires a snapshot before patching
+          {{ inventory_hostname }}. Take one now in the hypervisor,
+          then press ENTER to continue, or Ctrl-C + A to abort.
+      when: not (snapshot_taken | bool)
+      tags: [prep]
+
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      tags: [always]
+
+    - name: Build the OS key for repo lookup
+      ansible.builtin.set_fact:
+        intelerad_os_key: "{{ ansible_facts['distribution'] }}-{{ ansible_facts['distribution_major_version'] }}"
+      tags: [always]
+
+  tasks:
+    # ------------------------------------------------------ boot cleanup ----
+    - name: Read /boot usage
+      ansible.builtin.shell: |
+        set -o pipefail
+        df --output=pcent /boot | tail -n1 | tr -d ' %'
+      args:
+        executable: /bin/bash
+      register: boot_pct_raw
+      changed_when: false
+      tags: [prep]
+
+    - name: Set boot_pct fact
+      ansible.builtin.set_fact:
+        boot_pct: "{{ boot_pct_raw.stdout | int }}"
+      tags: [prep]
+
+    - name: Show /boot usage
+      ansible.builtin.debug:
+        msg: "/boot usage: {{ boot_pct }}% (threshold {{ boot_partition_threshold_percent }}%)"
+      tags: [prep]
+
+    - name: Ensure yum-utils is installed (provides package-cleanup)
+      ansible.builtin.yum:
+        name: yum-utils
+        state: present
+      tags: [prep]
+
+    - name: Remove older kernels (keep {{ keep_kernel_count }}) if /boot is above threshold
+      ansible.builtin.command: "package-cleanup -y --oldkernels --count={{ keep_kernel_count }}"
+      when: boot_pct | int >= boot_partition_threshold_percent
+      register: kernel_cleanup
+      changed_when: "'Removed' in kernel_cleanup.stdout or kernel_cleanup.rc == 0"
+      tags: [prep]
+
+    # ------------------------------------------------------- build filters --
+    - name: Build REPOS argument string
+      ansible.builtin.set_fact:
+        intelerad_repos_args: >-
+          {{ intelerad_repos_map[intelerad_os_key] if (use_repos_filter | bool) else '' }}
+      tags: [repos, upgrade]
+
+    - name: Build SKIP argument string
+      ansible.builtin.set_fact:
+        intelerad_skip_args: >-
+          {{ intelerad_excluded_packages
+             | map('regex_replace', '^(.*)$', '--exclude=\\1')
+             | join(' ') }}
+      tags: [repos, upgrade]
+
+    - name: Show effective yum filter args
+      ansible.builtin.debug:
+        msg:
+          - "REPOS: {{ intelerad_repos_args | trim }}"
+          - "SKIP : {{ intelerad_skip_args | trim }}"
+      tags: [repos, upgrade]
+
+    # -------------------------------------------- check-update confirmation --
+    - name: Run yum check-update — list excluded packages (must include corosync/pacemaker)
+      ansible.builtin.shell: |
+        set -o pipefail
+        {
+          echo "=== check-update (excluded) on $(date -Is) ==="
+          yum {{ intelerad_repos_args }} {{ intelerad_skip_args }} check-update | grep -i excluded || true
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: check_excluded
+      changed_when: false
+      tags: [repos]
+
+    - name: Assert corosync and pacemaker are in the excluded list
+      ansible.builtin.assert:
+        that:
+          - "'corosync' in check_excluded.stdout | lower"
+          - "'pacemaker' in check_excluded.stdout | lower"
+        fail_msg: >-
+          Safety check failed — corosync and/or pacemaker were not reported
+          as excluded by yum. Aborting before any updates are applied.
+      tags: [repos]
+
+    - name: Run yum check-update — list packages that WILL be updated
+      ansible.builtin.shell: |
+        set -o pipefail
+        {
+          echo "=== check-update (to be updated) on $(date -Is) ==="
+          yum {{ intelerad_repos_args }} {{ intelerad_skip_args }} check-update | grep -v -i excluded || true
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: check_to_update
+      changed_when: false
+      tags: [repos]
+
+    - name: Assert corosync/pacemaker are NOT in the to-be-updated list
+      ansible.builtin.assert:
+        that:
+          - "'corosync' not in (check_to_update.stdout | lower)"
+          - "'pacemaker' not in (check_to_update.stdout | lower)"
+        fail_msg: >-
+          Safety check failed — corosync or pacemaker appear in the list of
+          packages that would be updated. Aborting.
+      tags: [repos]
+
+    # ---------------------------------------------- pre-update PACS status --
+    - name: Capture pre-update PACS status
+      ansible.builtin.shell: |
+        {
+          echo "=== reportPacsStatus (pre-update) on $(date -Is) ==="
+          sudo -u admin /usr/local/tools/support/reportPacsStatus
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: pacs_status_before
+      changed_when: false
+      failed_when: false
+      tags: [verify, prep]
+
+    # ------------------------------------------------- stop PACS services ---
+    - name: Stop PACS services in the documented order
+      ansible.builtin.shell: |
+        set -e
+        {
+          echo "=== Stopping PACS stack on $(date -Is) ==="
+          sudo -u admin /usr/local/tools/PACS stop
+          sudo -u admin controlTomcat -t stop
+          /etc/init.d/postgres-intelerad stop
+          /etc/init.d/sybase -v stop
+          /etc/init.d/apache2 stop
+          echo "=== PACS stack stopped on $(date -Is) ==="
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      tags: [stop]
+
+    # -------------------------------------------------------------- update --
+    - name: Run yum update with REPOS and SKIP, capture log
+      ansible.builtin.shell: |
+        set -o pipefail
+        {
+          echo "=== yum update on $(date -Is) ==="
+          yum {{ intelerad_repos_args }} {{ intelerad_skip_args }} -y update
+          echo "=== yum update finished $(date -Is) ==="
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: yum_update
+      changed_when: "'No packages marked for update' not in yum_update.stdout and 'Nothing to do' not in yum_update.stdout"
+      tags: [upgrade]
+
+    - name: Symlink latest patching log
+      ansible.builtin.file:
+        src: "{{ log_file | basename }}"
+        dest: "{{ log_dir }}/latest.log"
+        state: link
+        force: true
+      tags: [upgrade]
+
+    # -------------------------------------------------------------- reboot --
+    - name: Reboot the PACS server
+      ansible.builtin.reboot:
+        msg: "Reboot triggered by Ansible Intelerad patching playbook"
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: 10
+        post_reboot_delay: 60
+        test_command: uptime
+      when: auto_reboot | bool
+      tags: [reboot]
+
+    # --------------------------------------------- post-reboot verification --
+    - name: Poll reportPacsStatus until OK (up to {{ pacs_status_retries * pacs_status_delay_seconds // 60 }} minutes)
+      ansible.builtin.shell: |
+        set -o pipefail
+        {
+          echo "--- reportPacsStatus attempt at $(date -Is) ---"
+          sudo -u admin /usr/local/tools/support/reportPacsStatus
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: pacs_status_after
+      changed_when: false
+      retries: "{{ pacs_status_retries }}"
+      delay: "{{ pacs_status_delay_seconds }}"
+      until: >-
+        pacs_status_after.rc == 0
+        and ('FAIL' not in (pacs_status_after.stdout | upper))
+        and ('ERROR' not in (pacs_status_after.stdout | upper))
+      failed_when: false
+      tags: [verify]
+
+    - name: Run checkRestarts to confirm processes restarted cleanly
+      ansible.builtin.shell: |
+        {
+          echo "=== checkRestarts on $(date -Is) ==="
+          sudo -u admin /usr/local/tools/support/checkRestarts
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: check_restarts
+      changed_when: false
+      failed_when: false
+      tags: [verify]
+
+    - name: Determine whether PACS came up cleanly
+      ansible.builtin.set_fact:
+        pacs_ok: >-
+          {{ pacs_status_after.rc == 0
+             and ('FAIL' not in (pacs_status_after.stdout | upper))
+             and ('ERROR' not in (pacs_status_after.stdout | upper)) }}
+      tags: [verify]
+
+    # ------------------------------------------------------- recovery -------
+    - name: Force-start PACS stack (recovery — only if status is not OK)
+      ansible.builtin.shell: |
+        set -e
+        {
+          echo "=== PACS recovery start on $(date -Is) ==="
+          /etc/init.d/sybase -v start
+          /etc/init.d/apache2 start
+          /etc/init.d/postgres-intelerad start
+          sudo -u admin controlTomcat -t start
+          sudo -u admin /usr/local/tools/PACS start
+          echo "=== PACS recovery start finished $(date -Is) ==="
+        } 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      when: not pacs_ok
+      tags: [recover, verify]
+
+    - name: Re-check reportPacsStatus after force-start
+      ansible.builtin.shell: |
+        sudo -u admin /usr/local/tools/support/reportPacsStatus 2>&1 | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: pacs_status_recovery
+      when: not pacs_ok
+      changed_when: false
+      failed_when: false
+      tags: [recover, verify]
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }} ({{ intelerad_os_key }})"
+          - "Log:  {{ log_file }}"
+          - "Excluded (never updated): {{ intelerad_excluded_packages | join(', ') }}"
+          - "REPOS filter applied: {{ use_repos_filter | bool }}"
+          - "PACS status OK after reboot: {{ pacs_ok }}"
+          - "Recovery start required: {{ not pacs_ok }}"
+          - "REMINDER: confirm with I.R that services are healthy, then remove the snapshot."
+      tags: [always]
