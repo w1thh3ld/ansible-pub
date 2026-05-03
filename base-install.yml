@@ -21,8 +21,9 @@
     # ----------------------------------------------------------------------
     packages:
       - sudo
-      - git
       - tree
+      - qemu-guest-agent
+      # - git
       # - htop
       # - vim
       # - curl
