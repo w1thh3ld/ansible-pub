@@ -1,10 +1,9 @@
 ---
 # intelerad-patch.yml
-# OS patching for IntelePACS servers, following Stoic IT's Intelerad
-# patching guide.
+# OS patching for IntelePACS servers running RHEL 8 or Rocky Linux 8.
 #
 # What this playbook does (in order):
-#   1.  Pre-flight: confirm snapshot, assert supported OS, prep log dir.
+#   1.  Pre-flight: assert supported OS (RHEL 8 / Rocky 8), prep log dir.
 #   2.  Boot-partition check; remove old kernels (keep 3) if /boot > 70%.
 #   3.  Build the per-OS REPOS filter and the SKIP filter that excludes
 #       corosync* and pacemaker* — these MUST NEVER be updated.
@@ -18,7 +17,7 @@
 #       checkRestarts. If PACS still down, run the documented force-start.
 #
 # Tags:
-#   prep      — pre-flight, snapshot prompt, boot cleanup
+#   prep      — pre-flight, boot cleanup
 #   repos     — build REPOS / SKIP, write check-update report
 #   stop      — stop PACS stack
 #   upgrade   — run yum update
@@ -26,16 +25,12 @@
 #   verify    — post-reboot PACS status / checkRestarts
 #   recover   — force-start PACS stack (only on failure)
 #
-# Per-host overrides (set in host_vars/<hostname>.yml):
-#   use_repos_filter: false   # e.g. NSRNM - DEPOT04A — skip the REPOS var
-#   snapshot_taken: true      # skip the snapshot pause prompt
-#
 # Usage:
 #   ansible-playbook -i inventory.ini intelerad-patch.yml
 #   ansible-playbook -i inventory.ini intelerad-patch.yml --check --diff
 #   ansible-playbook -i inventory.ini intelerad-patch.yml --tags verify
 
-- name: Patch an IntelePACS server
+- name: Patch an IntelePACS server (RHEL 8 / Rocky 8)
   hosts: intelerad
   become: true
   gather_facts: true
@@ -52,28 +47,15 @@
       - "pacemaker*"
 
     # ----------------------------------------------------------------------
-    # Per-OS repo filters from the Intelerad guide.
+    # Per-OS repo filters. Only RHEL 8 and Rocky 8 are supported.
     # ----------------------------------------------------------------------
     intelerad_repos_map:
-      CentOS-7: >-
-        --disablerepo=* --enablerepo=centos7-x86_64 --enablerepo=epel
-        --enablerepo=base --enablerepo=updates
-      RedHat-7: >-
-        --disablerepo=* --enablerepo=rhel-7-server-optional-rpms
-        --enablerepo=rhel-7-server-rpms --enablerepo=epel
-        --enablerepo=base --enablerepo=updates
       RedHat-8: >-
         --disablerepo=* --enablerepo=rhel-8-for-x86_64-baseos-rpms
         --enablerepo=rhel-8-for-x86_64-appstream-rpms --enablerepo=epel
-        --enablerepo=base --enablerepo=updates
-
-    # Default to applying the REPOS filter; override to false on hosts where
-    # the guide says to skip it (e.g. NSRNM - DEPOT04A).
-    use_repos_filter: true
-
-    # Set to true on a host (or on the command line with -e) once a snapshot
-    # has been taken; otherwise the play pauses and prompts.
-    snapshot_taken: false
+      Rocky-8: >-
+        --disablerepo=* --enablerepo=baseos --enablerepo=appstream
+        --enablerepo=extras --enablerepo=epel
 
     # Operational toggles
     auto_reboot: true                    # the guide always reboots
@@ -95,17 +77,8 @@
         fail_msg: >-
           Unsupported OS for Intelerad patching:
           {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
-          Supported: CentOS 7, RHEL 7, RHEL 8.
+          Supported: RHEL 8, Rocky Linux 8.
       tags: [always, prep]
-
-    - name: Pause for snapshot confirmation (skipped if snapshot_taken=true)
-      ansible.builtin.pause:
-        prompt: >-
-          The Intelerad guide requires a snapshot before patching
-          {{ inventory_hostname }}. Take one now in the hypervisor,
-          then press ENTER to continue, or Ctrl-C + A to abort.
-      when: not (snapshot_taken | bool)
-      tags: [prep]
 
     - name: Ensure log directory exists
       ansible.builtin.file:
@@ -143,9 +116,9 @@
         msg: "/boot usage: {{ boot_pct }}% (threshold {{ boot_partition_threshold_percent }}%)"
       tags: [prep]
 
-    - name: Ensure yum-utils is installed (provides package-cleanup)
-      ansible.builtin.yum:
-        name: yum-utils
+    - name: Ensure dnf-utils is installed (provides package-cleanup)
+      ansible.builtin.dnf:
+        name: dnf-utils
         state: present
       tags: [prep]
 
@@ -159,8 +132,7 @@
     # ------------------------------------------------------- build filters --
     - name: Build REPOS argument string
       ansible.builtin.set_fact:
-        intelerad_repos_args: >-
-          {{ intelerad_repos_map[intelerad_os_key] if (use_repos_filter | bool) else '' }}
+        intelerad_repos_args: "{{ intelerad_repos_map[intelerad_os_key] }}"
       tags: [repos, upgrade]
 
     - name: Build SKIP argument string
@@ -367,8 +339,7 @@
           - "Host: {{ inventory_hostname }} ({{ intelerad_os_key }})"
           - "Log:  {{ log_file }}"
           - "Excluded (never updated): {{ intelerad_excluded_packages | join(', ') }}"
-          - "REPOS filter applied: {{ use_repos_filter | bool }}"
           - "PACS status OK after reboot: {{ pacs_ok }}"
           - "Recovery start required: {{ not pacs_ok }}"
-          - "REMINDER: confirm with I.R that services are healthy, then remove the snapshot."
+          - "REMINDER: confirm with I.R that services are healthy."
       tags: [always]
