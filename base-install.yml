@@ -1,8 +1,9 @@
 ---
 # install-packages.yml
-# Installs a curated list of apt packages.
+# Installs a curated list of apt packages, plus optional .deb packages
+# downloaded from a URL.
 #
-# To add a package:    add a new "- name" line to the packages list below.
+# To add a package:    add a new "- name" line to the relevant list below.
 # To skip a package:   prefix the line with "#" to comment it out.
 #
 # Usage:
@@ -16,7 +17,7 @@
 
   vars:
     # ----------------------------------------------------------------------
-    # Edit this list — one package per line. Use "#" to comment a line out.
+    # APT packages — one per line. Use "#" to comment a line out.
     # ----------------------------------------------------------------------
     packages:
       - sudo
@@ -26,21 +27,83 @@
       # - vim
       # - curl
 
+    # ----------------------------------------------------------------------
+    # .deb packages from a URL.
+    #   name      — package name as dpkg will see it (used for idempotency)
+    #   url       — direct link to the .deb file
+    #   checksum  — optional, format: "sha256:abc123..." (recommended)
+    # Comment out an entire entry with "#" on each of its lines.
+    # ----------------------------------------------------------------------
+    deb_url_packages:
+      # - name: google-chrome-stable
+      #   url: https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+      # - name: code
+      #   url: https://update.code.visualstudio.com/latest/linux-deb-x64/stable
+      #   checksum: "sha256:REPLACE_WITH_REAL_HASH"
+
+    deb_download_dir: /var/cache/ansible-debs
+
   tasks:
+    # ------------------------------------------------------------- apt list --
     - name: Refresh apt cache (valid for 1 hour)
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Install packages
+    - name: Install apt packages
       ansible.builtin.apt:
         name: "{{ packages }}"
         state: present
       register: apt_install
 
+    # ------------------------------------------------------------ url debs ---
+    - name: Ensure download directory exists
+      ansible.builtin.file:
+        path: "{{ deb_download_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: deb_url_packages | length > 0
+
+    - name: Check whether each URL .deb is already installed
+      ansible.builtin.command: dpkg-query -W -f='${Status}' {{ item.name }}
+      register: deb_url_installed
+      changed_when: false
+      failed_when: false
+      loop: "{{ deb_url_packages }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Download .deb packages from URL
+      ansible.builtin.get_url:
+        url: "{{ item.item.url }}"
+        dest: "{{ deb_download_dir }}/{{ item.item.name }}.deb"
+        checksum: "{{ item.item.checksum | default(omit) }}"
+        mode: "0644"
+      loop: "{{ deb_url_installed.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: "'install ok installed' not in (item.stdout | default(''))"
+      register: deb_url_download
+
+    - name: Install downloaded .deb packages (resolves deps via apt)
+      ansible.builtin.apt:
+        deb: "{{ deb_download_dir }}/{{ item.item.item.name }}.deb"
+        state: present
+      loop: "{{ deb_url_download.results }}"
+      loop_control:
+        label: "{{ item.item.item.name }}"
+      when: item is not skipped and not (item.failed | default(false))
+      register: deb_url_install
+
+    # ----------------------------------------------------------- summary -----
     - name: Show what was installed
       ansible.builtin.debug:
-        msg: >-
-          {{ 'No changes — all packages already present.'
-             if not apt_install.changed
-             else 'Installed/updated: ' ~ (apt_install.stdout_lines | default([]) | join(' | ')) }}
+        msg:
+          - "apt changed: {{ apt_install.changed }}"
+          - "url debs installed this run: {{ deb_url_install.results
+              | default([])
+              | selectattr('changed', 'equalto', true)
+              | map(attribute='item.item.item.name')
+              | list }}"
