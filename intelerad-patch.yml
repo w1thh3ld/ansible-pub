@@ -9,12 +9,16 @@
 #       corosync* and pacemaker* — these MUST NEVER be updated.
 #   4.  Confirm the package list that *will* be updated and the excluded
 #       list, both written to the run log.
-#   5.  Capture pre-update PACS status (reportPacsStatus).
+#   5.  Capture pre-update PACS status (reportPacsStatus) as the baseline.
 #   6.  Stop PACS services gracefully in the documented order.
 #   7.  Run `yum ${REPOS} ${SKIP} update` with the log captured.
 #   8.  Reboot.
-#   9.  Re-run reportPacsStatus until OK (up to 10 minutes), then
-#       checkRestarts. If PACS still down, run the documented force-start.
+#   9.  Re-run reportPacsStatus immediately after the host comes back,
+#       diff against the baseline, and flag any differences.
+#   10. Wait 5 minutes, run reportPacsStatus again, diff against the
+#       baseline, and flag any remaining differences. Then run
+#       checkRestarts. If PACS still differs/fails, run the documented
+#       force-start as a recovery.
 #
 # Tags:
 #   prep      — pre-flight, boot cleanup
@@ -61,12 +65,14 @@
     auto_reboot: true                    # the guide always reboots
     boot_partition_threshold_percent: 70 # cleanup older kernels above this
     keep_kernel_count: 3
-    pacs_status_retries: 20              # 20 × 30s ≈ 10 minutes
-    pacs_status_delay_seconds: 30
+    post_reboot_settle_seconds: 300      # wait 5 min after reboot before 2nd check
     reboot_timeout: 900
 
     log_dir: /var/log/ansible-patching
     log_file: "{{ log_dir }}/intelerad-patch-{{ ansible_date_time.iso8601_basic_short }}.log"
+    pacs_status_baseline_file: "{{ log_dir }}/pacs-status-pre.log"
+    pacs_status_post_reboot_file: "{{ log_dir }}/pacs-status-post-reboot.log"
+    pacs_status_post_settle_file: "{{ log_dir }}/pacs-status-post-5min.log"
 
   pre_tasks:
     # ---------------------------------------------------------------- prep --
@@ -198,12 +204,15 @@
       tags: [repos]
 
     # ---------------------------------------------- pre-update PACS status --
-    - name: Capture pre-update PACS status
+    - name: Capture pre-update PACS status as baseline
       ansible.builtin.shell: |
+        set -o pipefail
+        sudo -u admin /usr/local/tools/support/reportPacsStatus \
+          > "{{ pacs_status_baseline_file }}" 2>&1
         {
-          echo "=== reportPacsStatus (pre-update) on $(date -Is) ==="
-          sudo -u admin /usr/local/tools/support/reportPacsStatus
-        } 2>&1 | tee -a "{{ log_file }}"
+          echo "=== reportPacsStatus (pre-update baseline) on $(date -Is) ==="
+          cat "{{ pacs_status_baseline_file }}"
+        } | tee -a "{{ log_file }}"
       args:
         executable: /bin/bash
       register: pacs_status_before
@@ -263,24 +272,81 @@
       tags: [reboot]
 
     # --------------------------------------------- post-reboot verification --
-    - name: Poll reportPacsStatus until OK (up to {{ pacs_status_retries * pacs_status_delay_seconds // 60 }} minutes)
+    - name: Capture reportPacsStatus immediately after reboot
       ansible.builtin.shell: |
-        set -o pipefail
+        sudo -u admin /usr/local/tools/support/reportPacsStatus \
+          > "{{ pacs_status_post_reboot_file }}" 2>&1
         {
-          echo "--- reportPacsStatus attempt at $(date -Is) ---"
-          sudo -u admin /usr/local/tools/support/reportPacsStatus
-        } 2>&1 | tee -a "{{ log_file }}"
+          echo "=== reportPacsStatus (post-reboot) on $(date -Is) ==="
+          cat "{{ pacs_status_post_reboot_file }}"
+        } | tee -a "{{ log_file }}"
       args:
         executable: /bin/bash
-      register: pacs_status_after
+      register: pacs_status_after_reboot
       changed_when: false
-      retries: "{{ pacs_status_retries }}"
-      delay: "{{ pacs_status_delay_seconds }}"
-      until: >-
-        pacs_status_after.rc == 0
-        and ('FAIL' not in (pacs_status_after.stdout | upper))
-        and ('ERROR' not in (pacs_status_after.stdout | upper))
       failed_when: false
+      tags: [verify]
+
+    - name: Diff baseline vs post-reboot reportPacsStatus
+      ansible.builtin.shell: |
+        {
+          echo "=== diff: pre-update baseline vs post-reboot on $(date -Is) ==="
+          diff -u "{{ pacs_status_baseline_file }}" "{{ pacs_status_post_reboot_file }}" || true
+        } | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: pacs_diff_post_reboot
+      changed_when: false
+      failed_when: false
+      tags: [verify]
+
+    - name: Flag differences immediately after reboot
+      ansible.builtin.debug:
+        msg:
+          - "*** PACS status differs from pre-update baseline immediately after reboot ***"
+          - "{{ pacs_diff_post_reboot.stdout_lines | default([]) }}"
+      when: pacs_diff_post_reboot.stdout | trim | length > 0
+      tags: [verify]
+
+    - name: Wait {{ post_reboot_settle_seconds // 60 }} minutes for services to settle
+      ansible.builtin.pause:
+        seconds: "{{ post_reboot_settle_seconds }}"
+      tags: [verify]
+
+    - name: Capture reportPacsStatus {{ post_reboot_settle_seconds // 60 }} minutes after reboot
+      ansible.builtin.shell: |
+        sudo -u admin /usr/local/tools/support/reportPacsStatus \
+          > "{{ pacs_status_post_settle_file }}" 2>&1
+        {
+          echo "=== reportPacsStatus (+{{ post_reboot_settle_seconds // 60 }}min) on $(date -Is) ==="
+          cat "{{ pacs_status_post_settle_file }}"
+        } | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: pacs_status_after_settle
+      changed_when: false
+      failed_when: false
+      tags: [verify]
+
+    - name: Diff baseline vs +{{ post_reboot_settle_seconds // 60 }}min reportPacsStatus
+      ansible.builtin.shell: |
+        {
+          echo "=== diff: pre-update baseline vs +{{ post_reboot_settle_seconds // 60 }}min on $(date -Is) ==="
+          diff -u "{{ pacs_status_baseline_file }}" "{{ pacs_status_post_settle_file }}" || true
+        } | tee -a "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      register: pacs_diff_post_settle
+      changed_when: false
+      failed_when: false
+      tags: [verify]
+
+    - name: Flag differences {{ post_reboot_settle_seconds // 60 }} minutes after reboot
+      ansible.builtin.debug:
+        msg:
+          - "*** PACS status STILL differs from pre-update baseline after {{ post_reboot_settle_seconds // 60 }} minutes ***"
+          - "{{ pacs_diff_post_settle.stdout_lines | default([]) }}"
+      when: pacs_diff_post_settle.stdout | trim | length > 0
       tags: [verify]
 
     - name: Run checkRestarts to confirm processes restarted cleanly
@@ -296,12 +362,15 @@
       failed_when: false
       tags: [verify]
 
-    - name: Determine whether PACS came up cleanly
+    - name: Determine whether PACS matches baseline and is otherwise healthy
       ansible.builtin.set_fact:
+        pacs_diff_immediate: "{{ pacs_diff_post_reboot.stdout | trim | length > 0 }}"
+        pacs_diff_after_settle: "{{ pacs_diff_post_settle.stdout | trim | length > 0 }}"
         pacs_ok: >-
-          {{ pacs_status_after.rc == 0
-             and ('FAIL' not in (pacs_status_after.stdout | upper))
-             and ('ERROR' not in (pacs_status_after.stdout | upper)) }}
+          {{ (pacs_diff_post_settle.stdout | trim | length == 0)
+             and (pacs_status_after_settle.rc == 0)
+             and ('FAIL' not in (pacs_status_after_settle.stdout | upper))
+             and ('ERROR' not in (pacs_status_after_settle.stdout | upper)) }}
       tags: [verify]
 
     # ------------------------------------------------------- recovery -------
@@ -338,8 +407,13 @@
         msg:
           - "Host: {{ inventory_hostname }} ({{ intelerad_os_key }})"
           - "Log:  {{ log_file }}"
+          - "Baseline:        {{ pacs_status_baseline_file }}"
+          - "Post-reboot:     {{ pacs_status_post_reboot_file }}"
+          - "Post-{{ post_reboot_settle_seconds // 60 }}min:      {{ pacs_status_post_settle_file }}"
           - "Excluded (never updated): {{ intelerad_excluded_packages | join(', ') }}"
-          - "PACS status OK after reboot: {{ pacs_ok }}"
+          - "Differs immediately after reboot: {{ pacs_diff_immediate }}"
+          - "Differs after {{ post_reboot_settle_seconds // 60 }}-minute settle: {{ pacs_diff_after_settle }}"
+          - "PACS status OK after settle period: {{ pacs_ok }}"
           - "Recovery start required: {{ not pacs_ok }}"
           - "REMINDER: confirm with I.R that services are healthy."
       tags: [always]
