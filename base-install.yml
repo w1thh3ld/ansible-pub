@@ -23,7 +23,7 @@
       - sudo
       - git
       - tree
-      - htop
+      # - htop
       # - vim
       # - curl
 
@@ -52,11 +52,16 @@
 
     - name: Install apt packages
       ansible.builtin.apt:
-        name: "{{ packages }}"
+        name: "{{ packages | default([], true) }}"
         state: present
+      when: (packages | default([], true)) | length > 0
       register: apt_install
 
     # ------------------------------------------------------------ url debs ---
+    - name: Normalise deb_url_packages (handle the all-commented-out case)
+      ansible.builtin.set_fact:
+        _deb_url_packages: "{{ deb_url_packages | default([], true) }}"
+
     - name: Ensure download directory exists
       ansible.builtin.file:
         path: "{{ deb_download_dir }}"
@@ -64,16 +69,17 @@
         owner: root
         group: root
         mode: "0755"
-      when: deb_url_packages | length > 0
+      when: _deb_url_packages | length > 0
 
     - name: Check whether each URL .deb is already installed
       ansible.builtin.command: dpkg-query -W -f='${Status}' {{ item.name }}
       register: deb_url_installed
       changed_when: false
       failed_when: false
-      loop: "{{ deb_url_packages }}"
+      loop: "{{ _deb_url_packages }}"
       loop_control:
         label: "{{ item.name }}"
+      when: _deb_url_packages | length > 0
 
     - name: Download .deb packages from URL
       ansible.builtin.get_url:
@@ -81,29 +87,36 @@
         dest: "{{ deb_download_dir }}/{{ item.item.name }}.deb"
         checksum: "{{ item.item.checksum | default(omit) }}"
         mode: "0644"
-      loop: "{{ deb_url_installed.results }}"
+      loop: "{{ deb_url_installed.results | default([]) }}"
       loop_control:
-        label: "{{ item.item.name }}"
-      when: "'install ok installed' not in (item.stdout | default(''))"
+        label: "{{ item.item.name | default('(skipped)') }}"
+      when:
+        - _deb_url_packages | length > 0
+        - item.skipped is not defined or not item.skipped
+        - "'install ok installed' not in (item.stdout | default(''))"
       register: deb_url_download
 
     - name: Install downloaded .deb packages (resolves deps via apt)
       ansible.builtin.apt:
         deb: "{{ deb_download_dir }}/{{ item.item.item.name }}.deb"
         state: present
-      loop: "{{ deb_url_download.results }}"
+      loop: "{{ deb_url_download.results | default([]) }}"
       loop_control:
-        label: "{{ item.item.item.name }}"
-      when: item is not skipped and not (item.failed | default(false))
+        label: "{{ item.item.item.name | default('(skipped)') }}"
+      when:
+        - _deb_url_packages | length > 0
+        - item is not skipped
+        - not (item.failed | default(false))
       register: deb_url_install
 
     # ----------------------------------------------------------- summary -----
     - name: Show what was installed
       ansible.builtin.debug:
         msg:
-          - "apt changed: {{ apt_install.changed }}"
+          - "apt changed: {{ apt_install.changed | default(false) }}"
           - "url debs installed this run: {{ deb_url_install.results
               | default([])
+              | rejectattr('skipped', 'defined')
               | selectattr('changed', 'equalto', true)
               | map(attribute='item.item.item.name')
               | list }}"
