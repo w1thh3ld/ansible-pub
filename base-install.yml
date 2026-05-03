@@ -1,0 +1,46 @@
+---
+# install-packages.yml
+# Installs a curated list of apt packages.
+#
+# To add a package:    add a new "- name" line to the packages list below.
+# To skip a package:   prefix the line with "#" to comment it out.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini install-packages.yml
+#   ansible-playbook -i inventory.ini install-packages.yml --check --diff   # dry run
+
+- name: Install baseline packages
+  hosts: debian13
+  become: true
+  gather_facts: true
+
+  vars:
+    # ----------------------------------------------------------------------
+    # Edit this list — one package per line. Use "#" to comment a line out.
+    # ----------------------------------------------------------------------
+    packages:
+      - sudo
+      - git
+      - tree
+      - htop
+      # - vim
+      # - curl
+
+  tasks:
+    - name: Refresh apt cache (valid for 1 hour)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install packages
+      ansible.builtin.apt:
+        name: "{{ packages }}"
+        state: present
+      register: apt_install
+
+    - name: Show what was installed
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'No changes — all packages already present.'
+             if not apt_install.changed
+             else 'Installed/updated: ' ~ (apt_install.stdout_lines | default([]) | join(' | ')) }}
