@@ -1,0 +1,391 @@
+---
+# windows-patch.yml
+# Patches Windows hosts in three passes:
+#   1. Microsoft Windows Update (security + critical + optional rollups)
+#   2. winget upgrade for third-party apps already managed by App Installer
+#   3. Direct-from-URL installers, with a version check so the download only
+#      runs when the version you've pinned in the playbook is newer than
+#      what's currently installed on the host.
+#
+# Reboots once at the end if anything asked for one.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini windows-patch.yml
+#   ansible-playbook -i inventory.ini windows-patch.yml --check --diff   # dry run
+#
+# Tags:
+#   windows-update — only run Microsoft Update
+#   winget         — only run winget upgrades
+#   url-pkgs       — only run URL-based installs
+#   reboot         — only evaluate the reboot step
+#
+# Requirements on the control node:
+#   ansible-galaxy collection install ansible.windows community.windows
+#
+# Requirements on the target:
+#   - WinRM or SSH configured for Ansible (see inventory.ini)
+#   - PowerShell 5.1+
+#   - For the winget pass: App Installer / winget present (Win10 1809+, Win11)
+
+- name: Patch Windows hosts (Windows Update + winget + URL installers)
+  hosts: windows
+  gather_facts: true
+
+  vars:
+    # ----------------------------------------------------------------------
+    # Windows Update categories. Drop categories you don't want.
+    # ----------------------------------------------------------------------
+    windows_update_categories:
+      - SecurityUpdates
+      - CriticalUpdates
+      - UpdateRollups
+      - DefinitionUpdates
+      # - FeaturePacks
+      # - ServicePacks
+      # - Drivers
+
+    # ----------------------------------------------------------------------
+    # winget — third-party apps already known to App Installer.
+    # Leave winget_packages empty to upgrade everything ("winget upgrade --all").
+    # Otherwise list specific package IDs ("winget search <name>" to find them).
+    # ----------------------------------------------------------------------
+    winget_upgrade_all: true
+    winget_packages: []
+      # - Mozilla.Firefox
+      # - Google.Chrome
+      # - 7zip.7zip
+      # - Notepad++.Notepad++
+      # - Microsoft.PowerShell
+      # - VideoLAN.VLC
+
+    # ----------------------------------------------------------------------
+    # URL packages — installers fetched directly from a vendor URL.
+    #
+    # Required fields:
+    #   name             Display name as it appears in "Programs and Features"
+    #                    (or a regex matching DisplayName in the registry).
+    #                    Used to look up the currently-installed version.
+    #   url              Direct download link to the installer (.exe or .msi).
+    #   version          The version that the URL above currently points to.
+    #                    The playbook installs only if this is NEWER than the
+    #                    version found on the target.
+    #   silent_args      Command-line switches that make the installer run
+    #                    silently. Defaults below cover common patterns.
+    #
+    # Optional fields:
+    #   installer_type   "exe" (default) or "msi". MSIs use win_package.
+    #   match_mode       "equal" (default) or "regex" — how to match `name`
+    #                    against the registry DisplayName.
+    #   product_id       For MSIs, the GUID. Lets win_package short-circuit
+    #                    without re-running the installer. Optional.
+    #   checksum         "sha256:abc123..." — verifies the download. Strongly
+    #                    recommended for anything internet-sourced.
+    #
+    # Comment out an entire entry by prefixing every line of it with "#".
+    # ----------------------------------------------------------------------
+    url_packages: []
+      # - name: Mozilla Firefox
+      #   match_mode: regex
+      #   url: https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=en-US
+      #   version: "125.0.3"
+      #   silent_args: "-ms"
+      #
+      # - name: 7-Zip
+      #   match_mode: regex
+      #   url: https://www.7-zip.org/a/7z2407-x64.msi
+      #   version: "24.07"
+      #   installer_type: msi
+      #   silent_args: "/qn /norestart"
+      #
+      # - name: Zoom
+      #   url: https://zoom.us/client/latest/ZoomInstallerFull.msi
+      #   version: "6.0.10"
+      #   installer_type: msi
+      #   silent_args: "/qn /norestart"
+
+    # ----------------------------------------------------------------------
+    # Where to drop downloaded installers and logs on the target.
+    # ----------------------------------------------------------------------
+    download_dir: 'C:\ProgramData\ansible-patching\downloads'
+    log_dir: 'C:\ProgramData\ansible-patching\logs'
+
+    # If true, reboot at the end when Windows Update or an installer asks.
+    auto_reboot: true
+    reboot_timeout: 1200
+
+  pre_tasks:
+    - name: Fail fast if this is not Windows
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'Windows'
+        fail_msg: "windows-patch.yml targets Windows hosts only."
+      tags: [always]
+
+    - name: Ensure download and log directories exist
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ download_dir }}"
+        - "{{ log_dir }}"
+      tags: [always]
+
+  tasks:
+    # ============================================================ Windows Update
+    - name: Install Windows Updates ({{ windows_update_categories | join(', ') }})
+      ansible.windows.win_updates:
+        category_names: "{{ windows_update_categories }}"
+        state: installed
+        reboot: false           # we handle the reboot ourselves at the end
+        log_path: "{{ log_dir }}\\win_updates.log"
+      register: win_updates_result
+      tags: [windows-update]
+
+    # ====================================================================== winget
+    - name: Detect whether winget is available on the host
+      ansible.windows.win_shell: |
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+          (winget --version) -replace '^v',''
+        } else {
+          'NOT_INSTALLED'
+        }
+      register: winget_version
+      changed_when: false
+      failed_when: false
+      tags: [winget]
+
+    - name: Note when winget is not installed
+      ansible.builtin.debug:
+        msg: >-
+          winget not found on {{ inventory_hostname }} — skipping the winget pass.
+          Install "App Installer" from the Microsoft Store (or via Windows Update)
+          if you want winget-managed third-party upgrades.
+      when: "winget_version.stdout is defined and 'NOT_INSTALLED' in winget_version.stdout"
+      tags: [winget]
+
+    - name: Accept winget source agreements (one-off, idempotent)
+      ansible.windows.win_shell: |
+        winget source update --accept-source-agreements | Out-Null
+      changed_when: false
+      failed_when: false
+      when: "winget_version.stdout is defined and 'NOT_INSTALLED' not in winget_version.stdout"
+      tags: [winget]
+
+    - name: Upgrade ALL winget-managed packages
+      ansible.windows.win_shell: |
+        $log = "{{ log_dir }}\winget-upgrade-all.log"
+        "=== winget upgrade --all on $(Get-Date -Format o) ===" | Out-File $log -Append
+        winget upgrade --all `
+          --silent `
+          --accept-package-agreements `
+          --accept-source-agreements `
+          --disable-interactivity 2>&1 | Tee-Object -FilePath $log -Append
+      register: winget_upgrade_all
+      changed_when: "'No applicable update found' not in winget_upgrade_all.stdout
+                     and 'No installed package found' not in winget_upgrade_all.stdout"
+      failed_when:
+        - winget_upgrade_all.rc is defined
+        - winget_upgrade_all.rc not in [0, -1978335189]   # -1978335189 = no updates
+      when:
+        - winget_version.stdout is defined
+        - "'NOT_INSTALLED' not in winget_version.stdout"
+        - winget_upgrade_all | bool
+        - (winget_packages | length) == 0
+      tags: [winget]
+
+    - name: Upgrade specific winget packages
+      ansible.windows.win_shell: |
+        winget upgrade --id "{{ item }}" `
+          --silent `
+          --accept-package-agreements `
+          --accept-source-agreements `
+          --disable-interactivity
+      loop: "{{ winget_packages }}"
+      loop_control:
+        label: "{{ item }}"
+      register: winget_upgrade_each
+      changed_when: "'No applicable update found' not in (winget_upgrade_each.stdout | default(''))
+                     and 'No installed package found' not in (winget_upgrade_each.stdout | default(''))"
+      failed_when:
+        - winget_upgrade_each.rc is defined
+        - winget_upgrade_each.rc not in [0, -1978335189, -1978335212]
+      when:
+        - winget_version.stdout is defined
+        - "'NOT_INSTALLED' not in winget_version.stdout"
+        - (winget_packages | length) > 0
+      tags: [winget]
+
+    # =================================================================== url pkgs
+    - name: Normalise url_packages (handles the all-commented-out case)
+      ansible.builtin.set_fact:
+        _url_packages: "{{ url_packages | default([], true) }}"
+      tags: [url-pkgs]
+
+    - name: Look up currently installed version for each URL package
+      # Searches both 64-bit and 32-bit uninstall registry hives. Returns the
+      # DisplayVersion of the first match, or "" if not installed.
+      ansible.windows.win_shell: |
+        $needle = @'
+        {{ item.name }}
+        '@
+        $mode = '{{ item.match_mode | default("equal") }}'
+        $paths = @(
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $entries = Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+          Where-Object { $_.DisplayName }
+        if ($mode -eq 'regex') {
+          $hit = $entries | Where-Object { $_.DisplayName -match $needle } | Select-Object -First 1
+        } else {
+          $hit = $entries | Where-Object { $_.DisplayName -eq $needle } | Select-Object -First 1
+        }
+        if ($hit) { $hit.DisplayVersion } else { '' }
+      register: url_installed
+      changed_when: false
+      failed_when: false
+      loop: "{{ _url_packages }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: _url_packages | length > 0
+      tags: [url-pkgs]
+
+    - name: Decide which URL packages need installing or upgrading
+      ansible.builtin.set_fact:
+        _url_pkgs_todo: >-
+          {{
+            (url_installed.results | default([]))
+            | map('combine', {})
+            | list
+            | rejectattr('skipped', 'defined')
+            | selectattr('item', 'defined')
+            | map('combine', {})
+            | list
+          }}
+      when: _url_packages | length > 0
+      tags: [url-pkgs]
+
+    - name: Show installed-vs-pinned versions
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.name }}:
+          installed='{{ item.stdout | default('') | trim }}'
+          pinned='{{ item.item.version }}'
+          → {{
+              'INSTALL' if (item.stdout | default('') | trim) == ''
+              else ('UPGRADE'
+                    if (item.item.version is version((item.stdout | default('') | trim), '>'))
+                    else 'SKIP (already at or newer than pinned)')
+          }}
+      loop: "{{ url_installed.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('(skipped)') }}"
+      when:
+        - _url_packages | length > 0
+        - item.skipped is not defined or not item.skipped
+      tags: [url-pkgs]
+
+    - name: Download URL installers that are missing or outdated
+      ansible.windows.win_get_url:
+        url: "{{ item.item.url }}"
+        dest: >-
+          {{ download_dir }}\{{ item.item.name | regex_replace('[^A-Za-z0-9._-]', '_') }}-{{ item.item.version }}.{{ item.item.installer_type | default('exe') }}
+        checksum: "{{ (item.item.checksum | default('')).split(':')[1] | default(omit, true) }}"
+        checksum_algorithm: "{{ (item.item.checksum | default('')).split(':')[0] | default('sha256', true) }}"
+        force: false
+      loop: "{{ url_installed.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('(skipped)') }}"
+      when:
+        - _url_packages | length > 0
+        - item.skipped is not defined or not item.skipped
+        - >-
+          (item.stdout | default('') | trim) == ''
+          or item.item.version is version((item.stdout | default('') | trim), '>')
+      register: url_download
+      tags: [url-pkgs]
+
+    - name: Install URL packages (.msi via win_package)
+      ansible.windows.win_package:
+        path: "{{ item.dest }}"
+        product_id: "{{ item.item.item.product_id | default(omit) }}"
+        arguments: "{{ item.item.item.silent_args | default('/qn /norestart') }}"
+        state: present
+      loop: "{{ url_download.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item.name | default('(skipped)') }}"
+      when:
+        - _url_packages | length > 0
+        - item is not skipped
+        - not (item.failed | default(false))
+        - (item.item.item.installer_type | default('exe')) == 'msi'
+      register: url_install_msi
+      tags: [url-pkgs]
+
+    - name: Install URL packages (.exe via win_command)
+      ansible.windows.win_command: >-
+        "{{ item.dest }}" {{ item.item.item.silent_args | default('/S') }}
+      loop: "{{ url_download.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item.name | default('(skipped)') }}"
+      when:
+        - _url_packages | length > 0
+        - item is not skipped
+        - not (item.failed | default(false))
+        - (item.item.item.installer_type | default('exe')) == 'exe'
+      register: url_install_exe
+      changed_when: true
+      tags: [url-pkgs]
+
+    # ==================================================================== reboot
+    - name: Check whether the system is requesting a reboot
+      ansible.windows.win_shell: |
+        $pending = $false
+        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending = $true }
+        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending = $true }
+        try {
+          $cm = Invoke-CimMethod -Namespace root\ccm\ClientSDK -ClassName CCM_ClientUtilities -MethodName DetermineIfRebootPending -ErrorAction Stop
+          if ($cm.RebootPending) { $pending = $true }
+        } catch {}
+        if ($pending) { 'REBOOT_REQUIRED' } else { 'NO_REBOOT' }
+      register: reboot_check
+      changed_when: false
+      tags: [reboot]
+
+    - name: Reboot host if updates or installers requested it
+      ansible.windows.win_reboot:
+        msg: "Reboot triggered by Ansible — Windows patching"
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: 10
+        post_reboot_delay: 30
+        test_command: whoami
+      when:
+        - auto_reboot | bool
+        - (win_updates_result.reboot_required | default(false))
+          or ('REBOOT_REQUIRED' in (reboot_check.stdout | default('')))
+      tags: [reboot]
+
+    # =================================================================== summary
+    - name: Compute summary numbers
+      vars:
+        wu_installed_q: "{{ win_updates_result.updates | default({}) | dict2items | selectattr('value.installed', 'defined') | selectattr('value.installed', 'equalto', true) | list | length }}"
+        url_installed_q: "{{ ((url_install_msi.results | default([])) + (url_install_exe.results | default([]))) | rejectattr('skipped', 'defined') | selectattr('changed', 'equalto', true) | map(attribute='item.item.item.name') | list }}"
+        winget_ran_q: "{{ winget_version.stdout is defined and ('NOT_INSTALLED' not in (winget_version.stdout | default(''))) }}"
+        reboot_done_q: "{{ (auto_reboot | bool) and ((win_updates_result.reboot_required | default(false)) or ('REBOOT_REQUIRED' in (reboot_check.stdout | default('')))) }}"
+      ansible.builtin.set_fact:
+        _summary_wu_installed: "{{ wu_installed_q }}"
+        _summary_url_installed: "{{ url_installed_q }}"
+        _summary_winget_ran: "{{ winget_ran_q }}"
+        _summary_reboot_done: "{{ reboot_done_q }}"
+      tags: [always]
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Windows Updates installed: {{ _summary_wu_installed }}"
+          - "Winget pass ran: {{ _summary_winget_ran }}"
+          - "URL packages defined: {{ _url_packages | default([]) | length }}"
+          - "URL packages installed/upgraded this run: {{ _summary_url_installed }}"
+          - "Reboot triggered: {{ _summary_reboot_done }}"
+      tags: [always]
