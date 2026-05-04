@@ -1,0 +1,233 @@
+---
+# fortigate-backup.yml
+# Pulls a FortiGate config via the REST API (no SSH needed) and uploads it to
+# a private S3 bucket with server-side encryption.
+#
+# Credentials live OUTSIDE this file — see "Where credentials come from" below.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini fortigate-backup.yml --ask-vault-pass
+#   ansible-playbook -i inventory.ini fortigate-backup.yml --ask-vault-pass --check --diff
+#   ansible-playbook -i inventory.ini fortigate-backup.yml --limit fw-acme-01
+#
+# Tags:
+#   fetch    — only pull configs from the FortiGates
+#   upload   — only upload already-fetched configs to S3
+#   cleanup  — only delete the local working copy after upload
+#
+# Requirements on the control node:
+#   ansible-galaxy collection install amazon.aws
+#   pip install boto3 botocore
+#
+# Where credentials come from (precedence: env var → vault var):
+#   FortiGate API token   $FORTIGATE_API_TOKEN   or   vault_fortigate_api_token
+#   AWS access key        $AWS_ACCESS_KEY_ID     or   vault_aws_access_key
+#   AWS secret key        $AWS_SECRET_ACCESS_KEY or   vault_aws_secret_key
+#   AWS session token     $AWS_SESSION_TOKEN     or   vault_aws_session_token  (optional)
+#
+#   Vault file (encrypted):
+#     ansible-vault create group_vars/fortigates/vault.yml
+#   Then put:
+#     vault_fortigate_api_token: <fgt-api-token>
+#     vault_aws_access_key: AKIA...
+#     vault_aws_secret_key: ...
+#
+#   To use a per-FortiGate token, set vault_fortigate_api_token in
+#   host_vars/<inventory_hostname>.yml instead.
+#
+# How to mint the FortiGate token:
+#   On the FortiGate (CLI):
+#     config system api-user
+#       edit "ansible-backup"
+#         set accprofile "super_admin_readonly"   # or a tighter custom profile
+#         set vdom "root"
+#         config trusthost
+#           edit 1
+#             set ipv4-trusthost <ansible-host-ip> 255.255.255.255
+#         end
+#       next
+#     end
+#     execute api-user generate-key ansible-backup    # prints the token ONCE — save it
+
+- name: Backup FortiGate configs to S3
+  hosts: fortigates
+  gather_facts: false
+  connection: local            # we talk to the FortiGate over HTTPS, not SSH
+  become: false
+
+  vars:
+    # ----------------------------------------------------------------------
+    # S3 destination
+    # ----------------------------------------------------------------------
+    s3_bucket: "msp-fortigate-backups"        # change me
+    s3_region: "ap-southeast-2"               # change me
+    s3_key_prefix: "fortigates"               # objects land at <prefix>/<hostname>/<date>/...
+    s3_encryption: "AES256"                   # "AES256" (SSE-S3) or "aws:kms"
+    s3_kms_key_id: ""                         # only required when s3_encryption == "aws:kms"
+
+    # ----------------------------------------------------------------------
+    # FortiGate API behaviour
+    # ----------------------------------------------------------------------
+    fortigate_port: 443
+    fortigate_vdom: "global"                  # "global" backs up the whole device; or a VDOM name
+    fortigate_validate_certs: false           # flip to true once you've installed proper CA-signed certs
+    fortigate_timeout: 60
+    # Optional — if set, FortiGate encrypts the .conf with this passphrase.
+    # Recommended (defence in depth on top of S3 SSE). Store in vault.
+    fortigate_backup_password: "{{ vault_fortigate_backup_password | default('') }}"
+
+    # ----------------------------------------------------------------------
+    # Local staging
+    # ----------------------------------------------------------------------
+    backup_dir: "/var/tmp/fortigate-backups"
+    delete_local_after_upload: true
+    timestamp: "{{ ansible_date_time.iso8601_basic_short | default(lookup('pipe','date -u +%Y%m%dT%H%M%SZ')) }}"
+    backup_filename: "{{ inventory_hostname }}-{{ timestamp }}.conf"
+    backup_local_path: "{{ backup_dir }}/{{ backup_filename }}"
+    s3_object_key: "{{ s3_key_prefix }}/{{ inventory_hostname }}/{{ timestamp[:8] }}/{{ backup_filename }}"
+
+    # ----------------------------------------------------------------------
+    # Credentials — sourced from env vars, falling back to vault.
+    # Do NOT hardcode any secret in this file.
+    # ----------------------------------------------------------------------
+    fortigate_api_token: "{{ lookup('env', 'FORTIGATE_API_TOKEN') | default(vault_fortigate_api_token | default(''), true) }}"
+    aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') | default(vault_aws_access_key | default(''), true) }}"
+    aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') | default(vault_aws_secret_key | default(''), true) }}"
+    aws_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default(vault_aws_session_token | default(''), true) }}"
+
+  pre_tasks:
+    - name: Refuse to run without a FortiGate API token
+      ansible.builtin.assert:
+        that:
+          - fortigate_api_token | length > 0
+        fail_msg: >-
+          No FortiGate API token found. Set $FORTIGATE_API_TOKEN or define
+          vault_fortigate_api_token in an encrypted vault file.
+      run_once: true
+      delegate_to: localhost
+      tags: [always]
+
+    - name: Refuse to run without AWS credentials
+      ansible.builtin.assert:
+        that:
+          - aws_access_key | length > 0
+          - aws_secret_key | length > 0
+        fail_msg: >-
+          AWS credentials not found. Export AWS_ACCESS_KEY_ID +
+          AWS_SECRET_ACCESS_KEY, or define vault_aws_access_key /
+          vault_aws_secret_key in an encrypted vault file.
+      run_once: true
+      delegate_to: localhost
+      tags: [always]
+
+    - name: Ensure local staging directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      run_once: true
+      tags: [always]
+
+    - name: Gather a timestamp on the control node
+      ansible.builtin.setup:
+        gather_subset: ['min']
+      delegate_to: localhost
+      tags: [always]
+
+  tasks:
+    # ============================================================== fetch
+    - name: Fetch config backup from {{ inventory_hostname }} via REST API
+      ansible.builtin.uri:
+        url: >-
+          https://{{ ansible_host | default(inventory_hostname) }}:{{ fortigate_port }}/api/v2/monitor/system/config/backup?scope={{ fortigate_vdom }}{{ ('&password=' + fortigate_backup_password) if (fortigate_backup_password | length > 0) else '' }}
+        method: GET
+        headers:
+          Authorization: "Bearer {{ fortigate_api_token }}"
+        validate_certs: "{{ fortigate_validate_certs | bool }}"
+        timeout: "{{ fortigate_timeout | int }}"
+        return_content: false
+        dest: "{{ backup_local_path }}"
+        status_code: 200
+      delegate_to: localhost
+      no_log: true                  # token is in the headers — keep it out of logs
+      register: fgt_fetch
+      tags: [fetch]
+
+    - name: Verify the downloaded file looks like a FortiGate config
+      ansible.builtin.shell: |
+        set -o pipefail
+        head -n 5 "{{ backup_local_path }}"
+      args:
+        executable: /bin/bash
+      register: fgt_head
+      changed_when: false
+      failed_when: >-
+        '#config-version' not in fgt_head.stdout
+        and 'config system' not in fgt_head.stdout
+      delegate_to: localhost
+      tags: [fetch]
+
+    - name: Show first lines of the backup (sanity check)
+      ansible.builtin.debug:
+        var: fgt_head.stdout_lines
+      tags: [fetch]
+
+    # ============================================================== upload
+    - name: Upload {{ backup_filename }} to s3://{{ s3_bucket }}/{{ s3_object_key }}
+      amazon.aws.s3_object:
+        bucket: "{{ s3_bucket }}"
+        object: "{{ s3_object_key }}"
+        src: "{{ backup_local_path }}"
+        mode: put
+        region: "{{ s3_region }}"
+        encrypt: true
+        encryption_mode: "{{ s3_encryption }}"
+        encryption_kms_key_id: "{{ s3_kms_key_id | default(omit, true) }}"
+        access_key: "{{ aws_access_key }}"
+        secret_key: "{{ aws_secret_key }}"
+        session_token: "{{ aws_session_token | default(omit, true) }}"
+        permission: private
+        tags:
+          source: "fortigate-backup-playbook"
+          fortigate: "{{ inventory_hostname }}"
+          taken_at: "{{ timestamp }}"
+          vdom: "{{ fortigate_vdom }}"
+      delegate_to: localhost
+      no_log: true                  # AWS keys are in the args — keep them out of logs
+      register: s3_upload
+      tags: [upload]
+
+    - name: Confirm the object now exists in S3
+      amazon.aws.s3_object_info:
+        bucket_name: "{{ s3_bucket }}"
+        object_name: "{{ s3_object_key }}"
+        region: "{{ s3_region }}"
+        access_key: "{{ aws_access_key }}"
+        secret_key: "{{ aws_secret_key }}"
+        session_token: "{{ aws_session_token | default(omit, true) }}"
+      delegate_to: localhost
+      no_log: true
+      register: s3_verify
+      tags: [upload]
+
+    # ============================================================== cleanup
+    - name: Remove local copy after successful upload
+      ansible.builtin.file:
+        path: "{{ backup_local_path }}"
+        state: absent
+      delegate_to: localhost
+      when: delete_local_after_upload | bool
+      tags: [cleanup]
+
+    # ============================================================== summary
+    - name: Per-host summary
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
+          - "VDOM scope: {{ fortigate_vdom }}"
+          - "S3 location: s3://{{ s3_bucket }}/{{ s3_object_key }}"
+          - "Object size: {{ (s3_verify.object_info[0].object_data.content_length | default('?')) }} bytes"
+          - "Encryption: {{ s3_encryption }}{{ ' / ' + s3_kms_key_id if s3_encryption == 'aws:kms' else '' }}"
+          - "Local copy retained: {{ not (delete_local_after_upload | bool) }}{{ ' — ' + backup_local_path if not (delete_local_after_upload | bool) else '' }}"
+      tags: [always]
